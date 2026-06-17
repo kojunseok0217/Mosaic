@@ -6,8 +6,8 @@ a framework for compositional multi-concept erasure in text-to-image diffusion
 models.
 
 <p align="center">
-  <img src="assets/method_pipeline.png" width="48%" alt="Mosaic method pipeline">
-  <img src="assets/qualitative.png" width="48%" alt="Qualitative comparison of Mosaic results">
+  <img src="assets/method_pipeline.png" width="63%" alt="Mosaic method pipeline">
+  <img src="assets/qualitative.png" width="32%" alt="Qualitative comparison of Mosaic results">
 </p>
 
 <p align="center">
