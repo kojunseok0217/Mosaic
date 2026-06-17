@@ -1,0 +1,20 @@
+__pycache__/
+
+# Experiment outputs
+results/
+outputs/
+mosaic_results/
+logs/
+wandb/
+
+# Model/checkpoint artifacts
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+checkpoint-*/
+Flux-erase-dev/
+
+# Local caches
+.cache/
+.huggingface/

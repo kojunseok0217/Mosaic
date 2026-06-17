@@ -1,0 +1,15 @@
+# pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+diffusers 
+transformers==4.57.3
+accelerate==1.0.1
+sentencepiece==0.2.0 
+protobuf==5.29.3 
+peft
+matplotlib
+scipy
+pandas
+datasets
+opencv-python
+pytorch-msssim
+sam3
+git+https://github.com/openai/CLIP.git
