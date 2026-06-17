@@ -13,10 +13,32 @@ This repository provides a compact pipeline for:
 - evaluating generated images with FID, VLM-based metrics, SSIM/MS-SSIM, and
   selective alignment.
 
+<p align="center">
+  <img src="assets/qualitative.png" width="95%" alt="Qualitative comparison of Mosaic results">
+</p>
+
+## Method Overview
+
+<p align="center">
+  <img src="assets/method_pipeline.png" width="95%" alt="Mosaic method pipeline">
+</p>
+
+Mosaic composes independently trained target-erasure LoRA adapters by blending
+their vector fields during inference. This enables multi-concept erasure while
+preserving prompt-relevant visual details that should remain in the generated
+image.
+
+## Benchmark Results
+
+<p align="center">
+  <img src="assets/benchmark.png" width="85%" alt="Benchmark comparison">
+</p>
+
 ## Repository Structure
 
 ```text
 Mosaic/
+  assets/                  # README figures
   evaluation/              # FID, VLM, SSIM/MS-SSIM, and alignment evaluation
   mosaic_runner/           # Mosaic inference runner
   prompt_generation/       # Prompt generation, prompt post-processing, prompts
