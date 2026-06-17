@@ -5,33 +5,13 @@ Official code release for
 a framework for compositional multi-concept erasure in text-to-image diffusion
 models.
 
-This repository provides a compact pipeline for:
-
-- generating and post-processing multi-concept prompts,
-- training target-erasure LoRA adapters,
-- running Mosaic with erased-concept LoRA weights, and
-- evaluating generated images with FID, VLM-based metrics, SSIM/MS-SSIM, and
-  selective alignment.
-
 <p align="center">
-  <img src="assets/qualitative.png" width="95%" alt="Qualitative comparison of Mosaic results">
+  <img src="assets/method_pipeline.png" width="48%" alt="Mosaic method pipeline">
+  <img src="assets/qualitative.png" width="48%" alt="Qualitative comparison of Mosaic results">
 </p>
 
-## Method Overview
-
 <p align="center">
-  <img src="assets/method_pipeline.png" width="95%" alt="Mosaic method pipeline">
-</p>
-
-Mosaic composes independently trained target-erasure LoRA adapters by blending
-their vector fields during inference. This enables multi-concept erasure while
-preserving prompt-relevant visual details that should remain in the generated
-image.
-
-## Benchmark Results
-
-<p align="center">
-  <img src="assets/benchmark.png" width="85%" alt="Benchmark comparison">
+  <img src="assets/benchmark.png" width="95%" alt="Benchmark comparison">
 </p>
 
 ## Repository Structure
