@@ -253,8 +253,6 @@ For target-erasure LoRA training, this repository builds on
 Aesthetic evaluation uses [IQA-PyTorch](https://github.com/chaofengc/IQA-PyTorch)
 and the [LAION Aesthetics predictor](https://github.com/christophschuhmann/improved-aesthetic-predictor).
 
-Please also follow the licenses and usage terms of the underlying models,
-datasets, and third-party libraries.
 
 ## Citation
 
