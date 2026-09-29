@@ -1,2 +1,0 @@
-from .base_feature_extractor import BaseFeatureExtractor
-from .inceptionV3_feature_extractor import InceptionV3FE

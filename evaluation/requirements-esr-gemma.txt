@@ -1,0 +1,7 @@
+# Separate environment: Gemma 4 12B uses gemma4_unified (not Gemma 3/standard Gemma 4).
+transformers==5.17.0
+accelerate>=1.10,<2
+torch>=2.7
+torchvision>=0.22
+pillow>=10
+tqdm

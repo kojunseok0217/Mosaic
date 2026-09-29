@@ -1,6 +1,7 @@
 import json
 import csv
 import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -59,11 +60,47 @@ def normalize_concept_name(name: str) -> str:
     return " ".join(name.strip().lower().split())
 
 
+def is_target_element(element: str, normalized_targets: set[str]) -> bool:
+    """Return whether an element names all or part of an erased target.
+
+    Selective-alignment noun lists sometimes use a shorter head noun than the
+    concept key (for example ``dog`` for ``Siberian Husky dog``).  Excluding
+    only exact strings would accidentally score preservation of the erased
+    target itself.  Token containment removes these lexical aliases while
+    avoiding arbitrary substring matches (for example ``cat`` in
+    ``caterpillar``).
+    """
+    normalized_element = normalize_concept_name(element)
+    if not normalized_element:
+        return False
+
+    element_tokens = set(normalized_element.split())
+    return any(
+        normalized_element == target
+        or element_tokens.issubset(set(target.split()))
+        for target in normalized_targets
+    )
+
+
 def parse_concept_key(concept_key: str) -> List[str]:
     """
     "A + B" 또는 "A + B + C" -> ["A", "B"] / ["A", "B", "C"]
     """
     return [x.strip() for x in concept_key.split(" + ") if x.strip()]
+
+
+def resolve_item_index(item: object, fallback_position: int) -> int:
+    """Resolve an image index as ``idx`` -> ``index`` -> list position."""
+    if isinstance(item, dict):
+        for key in ("idx", "index"):
+            value = item.get(key)
+            if value is None:
+                continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+    return int(fallback_position)
 
 
 def canonical_concept_signature(concepts: List[str]) -> tuple:
@@ -92,6 +129,44 @@ def present_ratio_from_verdict(per_entity: dict) -> float:
     total = len(per_entity)
     present = sum(1 for v in per_entity.values() if v == "PRESENT")
     return present / total
+
+
+def align_entity_verdict(per_entity: object, expected_elements: List[str]) -> Dict[str, str]:
+    """Return exactly one validated label for every requested element.
+
+    VLMs occasionally omit an entity, change its capitalization, or emit an
+    unsupported label.  Treat those cases as UNCERTAIN so the denominator
+    remains the complete requested entity set instead of being silently
+    reduced by the model response.
+    """
+    normalized_response: Dict[str, str] = {}
+    if isinstance(per_entity, dict):
+        for raw_key, raw_label in per_entity.items():
+            if not isinstance(raw_key, str) or not isinstance(raw_label, str):
+                continue
+            label = raw_label.strip().upper()
+            if label in {"PRESENT", "ABSENT", "UNCERTAIN"}:
+                normalized_response[normalize_concept_name(raw_key)] = label
+
+    return {
+        element: normalized_response.get(normalize_concept_name(element), "UNCERTAIN")
+        for element in expected_elements
+    }
+
+
+def unique_elements(elements: List[object]) -> List[str]:
+    """Drop invalid/duplicate noun entries while preserving their first spelling."""
+    output: List[str] = []
+    seen = set()
+    for element in elements:
+        if not isinstance(element, str) or not element.strip():
+            continue
+        signature = normalize_concept_name(element)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        output.append(element)
+    return output
 
 
 def append_jsonl(jsonl_path: str, record: dict):
@@ -437,23 +512,41 @@ def summarize_seed_from_jsonl(
 
 
 def append_seed_summary_csv(csv_path: str, row: Dict):
-    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
-    exists = os.path.isfile(csv_path)
+    """Atomically upsert one seed summary while preserving unrelated rows."""
+    path = Path(csv_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = ["method", "category", "seed", "mean_present_ratio", "evaluated"]
+    existing = []
+    if path.is_file():
+        with path.open("r", newline="", encoding="utf-8") as handle:
+            existing = list(csv.DictReader(handle))
+    key = (str(row["method"]), str(row["category"]), str(row["seed"]))
+    existing = [
+        old
+        for old in existing
+        if (old.get("method", ""), old.get("category", ""), old.get("seed", "")) != key
+    ]
+    existing.append({
+        "method": str(row["method"]),
+        "category": str(row["category"]),
+        "seed": str(row["seed"]),
+        "mean_present_ratio": f"{row['mean_present_ratio']:.6f}",
+        "evaluated": str(row["evaluated"]),
+    })
 
-    with open(csv_path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=["method", "category", "seed", "mean_present_ratio", "evaluated"]
-        )
-        if not exists:
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    os.close(fd)
+    temporary_path = Path(temporary_name)
+    try:
+        with temporary_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
-        writer.writerow({
-            "method": row["method"],
-            "category": row["category"],
-            "seed": row["seed"],
-            "mean_present_ratio": f"{row['mean_present_ratio']:.6f}",
-            "evaluated": row["evaluated"],
-        })
+            writer.writerows(existing)
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 # ======================================================
@@ -466,10 +559,10 @@ def main():
     parser.add_argument(
         "--results_root",
         type=str,
-        default="/home/juniboy97/workspace/Diffusion-Unlearning/multi_concept_erasure/SplitFlow/results",
+        default=str(Path(__file__).resolve().parents[1] / "outputs"),
     )
     parser.add_argument("--category", type=str, default="intra_2_character")
-    parser.add_argument("--method_dirname", type=str, default="flowblending_multi_scale_ema")
+    parser.add_argument("--method_dirname", type=str, default="mosaic")
     parser.add_argument(
         "--image_filename",
         type=str,
@@ -480,7 +573,7 @@ def main():
     parser.add_argument(
         "--element_json",
         type=str,
-        default="/home/juniboy97/workspace/Diffusion-Unlearning/multi_concept_erasure/SplitFlow/prompts/prompt_final/selective_alignment/intra_2_character.json",
+        default=str(Path(__file__).resolve().parents[1] / "prompt_generation/prompts/intra_2_character.json"),
     )
     parser.add_argument(
         "--out_csv",
@@ -506,6 +599,14 @@ def main():
         default=None,
         help="CSV/JSON에 기록할 method 이름 (미지정 시 method_dirname 사용)",
     )
+    parser.add_argument(
+        "--exclude_target_concepts",
+        action="store_true",
+        help=(
+            "concept_key의 target과 대소문자/공백 정규화 후 같거나, "
+            "target의 단어 부분집합인 noun을 평가에서 제외"
+        ),
+    )
 
     # vlm
     parser.add_argument("--model_id", type=str, default="Qwen/Qwen3-VL-8B-Instruct")
@@ -515,6 +616,8 @@ def main():
     # runtime
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--eval_seeds", type=int, nargs="+", default=[42])
+    parser.add_argument("--allow_partial", action="store_true",
+                        help="Allow missing/path-failure samples in an intentional partial run.")
     parser.add_argument("--verbose", action="store_true")
 
     args = parser.parse_args()
@@ -574,13 +677,17 @@ def main():
 
             print(f"\n[Concept] {concept_key} | seed={eval_seed}")
             concept_start = time.time()
+            normalized_targets = {
+                normalize_concept_name(concept)
+                for concept in parse_concept_key(concept_key)
+            }
 
             valid_samples = []
 
             # -----------------------------------
             # 1) 샘플 수집 + 기존 중간결과 resume
             # -----------------------------------
-            for index, entry in enumerate(entries):
+            for sampled_position, entry in enumerate(entries):
                 total += 1
 
                 if not isinstance(entry, dict) or "prompt" not in entry or "nouns" not in entry:
@@ -591,12 +698,29 @@ def main():
 
                 prompt = entry["prompt"]
                 elements = entry["nouns"]
+                index = resolve_item_index(entry, sampled_position)
 
-                if not isinstance(elements, list) or not isinstance(index, int):
+                if not isinstance(elements, list):
                     skipped += 1
                     if args.verbose:
                         print(f"[WARN] concept={concept_key}: invalid nouns/index. skip.")
                     continue
+
+                elements = unique_elements(elements)
+                if args.exclude_target_concepts:
+                    elements = [
+                        element
+                        for element in elements
+                        if not is_target_element(element, normalized_targets)
+                    ]
+                    if not elements:
+                        skipped += 1
+                        if args.verbose:
+                            print(
+                                f"[WARN] concept={concept_key} | index={index}: "
+                                "no nouns remain after excluding target concepts. skip."
+                            )
+                        continue
 
                 uid = make_sample_uid(method_name, args.category, concept_key, index, eval_seed)
         
@@ -626,6 +750,7 @@ def main():
 
                 if not os.path.exists(img_path):
                     skipped += 1
+                    failed += 1
                     if args.verbose:
                         print(f"[WARN] Missing image: {img_path}")
                     continue
@@ -684,7 +809,10 @@ def main():
                     )
                     
                     for sample, verdict in zip(batch_meta, verdicts):
-                        per_entity = verdict.get("per_entity", {})
+                        per_entity = align_entity_verdict(
+                            verdict.get("per_entity", {}), sample["elements"]
+                        )
+                        verdict["per_entity"] = per_entity
                         r = present_ratio_from_verdict(per_entity)
                         done += 1
 
@@ -723,7 +851,10 @@ def main():
                                 max_new_tokens=args.max_new_tokens,
                             )[0]
                             
-                            per_entity = verdict.get("per_entity", {})
+                            per_entity = align_entity_verdict(
+                                verdict.get("per_entity", {}), sample["elements"]
+                            )
+                            verdict["per_entity"] = per_entity
                             r = present_ratio_from_verdict(per_entity)
                             done += 1
 
@@ -794,6 +925,7 @@ def main():
         "batch_size": args.batch_size,
         "eval_seeds": args.eval_seeds,
         "max_new_tokens": args.max_new_tokens,
+        "exclude_target_concepts": args.exclude_target_concepts,
         "per_seed_summary": seed_summaries,
         "overall_weighted_mean_present_ratio": weighted_mean,
         "overall_evaluated": total_eval_count,
@@ -821,6 +953,11 @@ def main():
     print(f"intermediate_jsonl={os.path.abspath(args.save_jsonl)}")
     print(f"summary_csv={os.path.abspath(args.out_csv)}")
     print(f"summary_json={os.path.abspath(args.summary_json)}")
+    if failed and not args.allow_partial:
+        raise RuntimeError(
+            f"Selective-alignment evaluation had {failed} image/path/model failure(s); "
+            "rerun with the same JSONL after fixing the underlying issue."
+        )
     print(f"=== TOTAL TIME: {total_time/60:.2f} minutes ({total_time:.2f} sec) ===")
     print(f"{'=' * 80}")
 

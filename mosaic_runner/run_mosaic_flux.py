@@ -462,7 +462,16 @@ def run_mosaic(
 
     adapter_names = [f"lora_{i}" for i in range(K)]
     for name, lp in zip(adapter_names, lora_paths):
-        pipe.load_lora_weights(lp, adapter_name=name)
+        # 오프라인 모드(HF_HUB_OFFLINE=1)에서는 diffusers가 weight 파일명을 자동 추측하지
+        # 못하므로 weight_name을 명시적으로 넘겨야 한다. lp는 .safetensors 파일의 전체 경로.
+        if os.path.isfile(lp):
+            pipe.load_lora_weights(
+                os.path.dirname(lp),
+                weight_name=os.path.basename(lp),
+                adapter_name=name,
+            )
+        else:
+            pipe.load_lora_weights(lp, adapter_name=name)
 
     os.makedirs(save_dir, exist_ok=True)
 
@@ -930,6 +939,9 @@ def parse_args():
 
     # required-ish
     parser.add_argument("--model_id", type=str, required=True)
+    parser.add_argument("--cache_dir", type=str,
+                        default=None,
+                        help="Optional Hugging Face model cache directory")
     parser.add_argument("--json_path", type=str, required=True)
     parser.add_argument("--lora_root", type=str, required=True)
     parser.add_argument("--save_dir", type=str, required=True)
@@ -1013,7 +1025,7 @@ def main():
     # 1) Load base model
     # =====================================================
     device_base = torch.device(args.device)
-    pipe = FluxPipeline.from_pretrained(args.model_id, torch_dtype=torch.float16).to(device_base)
+    pipe = FluxPipeline.from_pretrained(args.model_id, torch_dtype=torch.float16, cache_dir=args.cache_dir).to(device_base)
     pipe.set_progress_bar_config(disable=True)
     overall_pbar = tqdm(keys_to_run, desc="All concepts", unit="concept")
     for concept_key in overall_pbar:

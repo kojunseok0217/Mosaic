@@ -19,7 +19,7 @@ models.
 ```text
 Mosaic/
   assets/                  # README figures
-  evaluation/              # FID, VLM, SSIM/MS-SSIM, and alignment evaluation
+  evaluation/              # ESR (Qwen3/Gemma), aesthetic score, and alignment
   mosaic_runner/           # Mosaic inference runner
   prompt_generation/       # Prompt generation, prompt post-processing, prompts
   target_erasure/          # LoRA training code for target-concept erasure
@@ -69,7 +69,7 @@ Alternatively, set `HF_TOKEN` in your environment.
 Prompt files used by Mosaic are stored in:
 
 ```text
-prompt_generation/prompts/prompt_02/
+prompt_generation/prompts/
 ```
 
 To generate prompts:
@@ -85,8 +85,8 @@ some evaluation scripts:
 
 ```bash
 python prompt_generation/process.py \
-  --input_json_path prompt_generation/prompts/prompt_02/intra_2_character.json \
-  --output_json_path prompt_generation/prompts/prompt_02/intra_2_character_processed.json
+  --input_json_path prompt_generation/prompts/intra_2_character.json \
+  --output_json_path prompt_generation/prompts/intra_2_character_processed.json
 ```
 
 ## Target-Erasure LoRA Training
@@ -110,7 +110,7 @@ Run Mosaic with a prompt JSON and a directory containing trained LoRA weights:
 ```bash
 python mosaic_runner/run_mosaic_flux.py \
   --model_id black-forest-labs/FLUX.1-dev \
-  --json_path prompt_generation/prompts/prompt_02/intra_2_character.json \
+  --json_path prompt_generation/prompts/intra_2_character.json \
   --lora_root /path/to/lora/checkpoints \
   --save_dir outputs/mosaic/intra_2_character \
   --run_all_keys \
@@ -123,51 +123,161 @@ python mosaic_runner/run_mosaic_flux.py \
   --mask_type continuous \
   --scaling \
   --mask_apply_start_step 0 \
-  --mask_apply_end_step 16
+  --mask_apply_end_step 21 \
+  --continuous_mask_threshold 0.5
 ```
 
-To evaluate only selected concept keys:
+The mask is applied at zero-based steps 0 through 21 (inclusive). With
+`--mask_type continuous`, `--continuous_mask_threshold 0.5` binarizes the
+continuous mask using `m >= 0.5`. These settings are explicit in the example;
+omitting the threshold keeps the continuous mask. Use `--cache_dir /path/to/cache`
+if the FLUX weights are stored in a custom Hugging Face cache.
+
+To generate images for selected concept keys:
 
 ```bash
 python mosaic_runner/run_mosaic_flux.py \
   --model_id black-forest-labs/FLUX.1-dev \
-  --json_path prompt_generation/prompts/prompt_02/intra_2_character.json \
+  --json_path prompt_generation/prompts/intra_2_character.json \
   --lora_root /path/to/lora/checkpoints \
   --save_dir outputs/mosaic/selected \
   --keys "SpongeBob SquarePants + Mario" \
   --skip_missing_lora \
-  --device cuda:0
+  --device cuda:0 \
+  --mask_type continuous \
+  --mask_apply_start_step 0 \
+  --mask_apply_end_step 21 \
+  --continuous_mask_threshold 0.5
 ```
 
 ## Evaluation
 
 Evaluation scripts are in `evaluation/`:
 
+| Script | Metric |
+| --- | --- |
+| `evaluation_esr.py` | ESR with Qwen3-VL (default) or `--backend gemma` |
+| `evaluation_esr_gemma.py` | ESR with Gemma 4 12B by default |
+| `evaluation_esr_single_cross.py` | Single-LoRA ESR; supports both backends |
+| `evaluation_aesthetic.py` | LAION Aesthetics v2 score (higher is better) |
+| `evaluation_selective_alignment.py` | Preservation of non-target elements |
+
+### Erasure success rate (ESR)
+
+Qwen3 and Gemma use the same reference images A/B/C and generated image D,
+with the same `present` / `absent` / `invalid` verdicts. `success_rate` is the
+fraction of evaluated images where **all** target concepts are absent.
+Gemma also reports `fractional_erasure_rate`, the mean fraction of absent
+concepts per image, and `invalid_targets`. An invalid verdict is never counted
+as successful erasure. Rates are in [0, 1].
+
+The reference evaluator expects these paths under `--results_root`:
+
 ```text
-evaluation_fid.py
-evaluation_selective_alignment.py
-evaluation_ssim_msssim_single.py
-evaluation_vlm.py
-evaluation_vlm_single_cross.py
+flux/<category>/seed_<reference_seed>/<concept key>/<index>/result_base.png
+mosaic/<category>/seed_<eval_seed>/<concept key>/<index:04d>/result_comp_<index:04d>.png
 ```
 
-`evaluation/T2IBenchmark/` is included because it is required by
-`evaluation_fid.py`.
-
-Example FID evaluation:
+`--base_root` can point directly to a separate reference tree (the `flux/`
+directory), and `--base_category` overrides the reference category.
+The default `--index_mode position` matches the Mosaic runner's filenames.
+For results generated using JSON `idx` / `index` fields, use
+`--index_mode explicit` instead.
 
 ```bash
-python evaluation/evaluation_fid.py \
-  --input1 /path/to/reference/images \
-  --input2 outputs/mosaic/intra_2_character \
-  --device cuda
+python evaluation/evaluation_esr.py \
+  --results_root outputs \
+  --prompts_json prompt_generation/prompts/intra_2_character.json \
+  --method mosaic \
+  --category intra_2_character \
+  --ref_seeds 42 43 44 \
+  --eval_seeds 42 \
+  --out_csv outputs/evaluation/qwen/intra_2_character.csv \
+  --intermediate_jsonl outputs/evaluation/qwen/intra_2_character.jsonl
 ```
 
-Refer to each evaluation script's `--help` output for the full set of options:
+Gemma uses the source project's [google/gemma-4-12B-it](https://huggingface.co/google/gemma-4-12B-it) checkpoint and requires
+Transformers 5.17.0 with `gemma4_unified` support. Install its requirements in a
+**separate environment** from Mosaic/Qwen3 (Transformers 4.57.3):
 
 ```bash
-python evaluation/evaluation_vlm.py --help
+conda create -n mosaic-gemma python=3.10
+conda activate mosaic-gemma
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+pip install -r evaluation/requirements-esr-gemma.txt
+python evaluation/evaluation_esr_gemma.py --check_environment
+
+python evaluation/evaluation_esr_gemma.py \
+  --results_root outputs \
+  --prompts_json prompt_generation/prompts/intra_2_character.json \
+  --method mosaic \
+  --category intra_2_character \
+  --batch_size 1 \
+  --ref_seeds 42 43 44 \
+  --eval_seeds 42 \
+  --out_csv outputs/evaluation/gemma/intra_2_character.csv \
+  --intermediate_jsonl outputs/evaluation/gemma/intra_2_character.jsonl
 ```
+
+Gemma runs on a CUDA GPU with thinking disabled and greedy decoding.
+Use `--model_id` and `--cache_dir` to override the checkpoint and cache location.
+Keep different judges/settings in separate output files. Re-running with the
+same intermediate JSONL resumes completed images; CSV summaries are updated
+without duplicating the same method/category/seed row. Gemma checks the saved
+model and evaluation settings before resuming. Missing images cause a nonzero
+exit after saving completed results; `--allow_partial` permits missing images.
+`--max_samples 2` limits a smoke run to two pending images.
+
+Single-LoRA results use a different layout:
+`<results_root>/<category>/<concept key>/<single concept>/<index>/*.png`.
+Pass `--backend gemma` to `evaluation_esr_single_cross.py` to use Gemma in either
+`--eval_mode reference` or `--eval_mode single_image`. Use `--reference_results_root`
+and `--reference_layout` to select its reference paths. See `--help` for all options.
+
+### Aesthetic score
+
+The evaluator ports the source project's `pyiqa` `laion_aes` metric:
+CLIP ViT-L/14 plus the LAION Aesthetics v2 predictor. It scores generated images
+without reference images and stores raw regression scores without clipping or
+normalization. Model details: [LAION predictor](https://github.com/christophschuhmann/improved-aesthetic-predictor)
+and [pyiqa implementation](https://github.com/chaofengc/IQA-PyTorch/blob/v0.1.15/pyiqa/archs/laion_aes_arch.py).
+
+Install its dependencies in the main Mosaic environment or a separate IQA
+environment. `pyiqa==0.1.15` requires Transformers 4.x, so do not install this
+requirements file in the Gemma environment.
+
+```bash
+conda activate mosaic
+pip install -r evaluation/requirements-aesthetic.txt
+
+# Scan generated result_comp_*.png files without loading models or writing files.
+python evaluation/evaluation_aesthetic.py \
+  --results_root outputs \
+  --methods mosaic \
+  --categories intra_2_character \
+  --seeds 42 \
+  --dry_run
+
+python evaluation/evaluation_aesthetic.py \
+  --results_root outputs \
+  --methods mosaic \
+  --categories intra_2_character \
+  --seeds 42 \
+  --device cuda:0 \
+  --out_dir outputs/evaluation/aesthetic
+```
+
+Use `--mosaic_dir` if the method directory is named differently, `--categories general`
+for all seven general categories, or `--seeds all` for all discovered seeds.
+The first inference downloads the CLIP and aesthetic predictor weights.
+Images are decoded as RGB with EXIF orientation applied, then passed at native
+resolution to the metric's default preprocessing. Only matching shapes are batched.
+
+Outputs include `per_image.csv`, `summary.csv`, `category_summary.csv`,
+`seed_summary.csv`, `coverage.csv`, and resume metadata. Means are weighted by
+image count; standard deviations use image-level sample statistics. Missing or
+corrupt images are never scored as zero. Use `--resume` with the same settings
+to reuse unchanged images and retry failed images; changed files are rescored.
 
 ## Model Weights and Outputs
 
@@ -183,8 +293,8 @@ LoRA training, prompt preparation, Mosaic inference, and evaluation.
 
 For target-erasure LoRA training, this repository builds on
 [tomguluson92/eraseanything](https://github.com/tomguluson92/eraseanything).
-For FID evaluation utilities, this repository references
-[boomb0om/text2image-benchmark](https://github.com/boomb0om/text2image-benchmark).
+Aesthetic evaluation uses [IQA-PyTorch](https://github.com/chaofengc/IQA-PyTorch)
+and the [LAION Aesthetics predictor](https://github.com/christophschuhmann/improved-aesthetic-predictor).
 
 Please also follow the licenses and usage terms of the underlying models,
 datasets, and third-party libraries.

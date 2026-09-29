@@ -1,8 +1,10 @@
 import os
 import json
 import csv
+import tempfile
 import time
 import argparse
+import hashlib
 from pathlib import Path
 from typing import Dict, List
 
@@ -10,7 +12,37 @@ from PIL import Image
 from tqdm import tqdm
 
 import torch
-from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+
+
+def upsert_summary_csv(csv_path: Path, row: Dict[str, object]) -> None:
+    """Atomically replace the same method/category/seed summary row."""
+    fieldnames = list(row)
+    existing: List[Dict[str, str]] = []
+    if csv_path.is_file():
+        with csv_path.open("r", newline="", encoding="utf-8") as handle:
+            existing = list(csv.DictReader(handle))
+    key = (str(row["method"]), str(row["category"]), str(row["seed"]))
+    existing = [
+        old
+        for old in existing
+        if (old.get("method", ""), old.get("category", ""), old.get("seed", "")) != key
+    ]
+    existing.append({name: str(row[name]) for name in fieldnames})
+
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{csv_path.name}.", suffix=".tmp", dir=csv_path.parent
+    )
+    os.close(fd)
+    temporary_path = Path(temporary_name)
+    try:
+        with temporary_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(existing)
+        os.replace(temporary_path, csv_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 # -------------------------------------------------
@@ -59,6 +91,14 @@ def parse_concept_key(concept_key: str) -> List[str]:
     "A + B" 또는 "A + B + C" -> ["A", "B"] / ["A", "B", "C"]
     """
     return [x.strip() for x in concept_key.split(" + ") if x.strip()]
+
+
+def get_image_index(item: Dict, position: int, index_mode: str) -> int:
+    """Match either positional filenames or explicit IDs in a prompt JSON."""
+    idx = position if index_mode == "position" else item.get("idx", item.get("index", position))
+    if type(idx) is not int or idx < 0:
+        raise ValueError(f"Invalid image index at position {position}: {idx!r}")
+    return idx
 
 
 def canonical_concept_signature(concepts: List[str]) -> tuple:
@@ -430,30 +470,58 @@ def summarize_from_jsonl(
 # -------------------------------------------------
 # Main
 # -------------------------------------------------
-def main():
+def main(backend="qwen", argv=None):
     parser = argparse.ArgumentParser()
+    model_defaults = {
+        "qwen": "Qwen/Qwen3-VL-32B-Instruct",
+        "gemma": "google/gemma-4-12B-it",
+    }
 
     parser.add_argument("--results_root", type=str, required=True)
     parser.add_argument("--prompts_json", type=str, required=True)
     parser.add_argument("--method", type=str, required=True)
     parser.add_argument("--base", type=str, default="flux")
+    parser.add_argument("--base_root", type=str, default=None,
+                        help="Separate reference image root; defaults to results_root/base")
     parser.add_argument("--category", type=str, required=True)
+    parser.add_argument("--base_category", type=str, default=None,
+                        help="Reference category when different from the after-image category")
+    parser.add_argument("--index_mode", choices=["position", "explicit"], default="position",
+                        help="Image IDs: list position (Mosaic runner) or JSON idx/index")
 
-    parser.add_argument("--model_id", type=str, default="Qwen/Qwen3-VL-32B-Instruct")
+    parser.add_argument("--backend", choices=["qwen", "gemma"], default=backend)
+    parser.add_argument("--model_id", type=str, default=None)
+    parser.add_argument("--cache_dir", default=None, help="Optional Hugging Face model cache directory")
     parser.add_argument("--max_new_tokens", type=int, default=16)
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--max_samples", type=int, default=0,
+                        help="Limit pending image samples for a smoke run; 0 evaluates all")
 
     parser.add_argument("--ref_seeds", type=int, nargs="+", default=[42, 43, 44],
                         help="before image reference seeds")
     parser.add_argument("--eval_seeds", type=int, nargs="+", default=[42],
                         help="after image seeds to evaluate")
 
-    parser.add_argument("--out_csv", type=str, default="./vlm_eval_summary.csv")
-    parser.add_argument("--intermediate_jsonl", type=str, default="./vlm_eval_intermediate.jsonl")
+    parser.add_argument("--out_csv", type=str, default=None)
+    parser.add_argument("--intermediate_jsonl", type=str, default=None)
 
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--allow_partial", action="store_true",
+                        help="Allow missing images; preparation and inference errors still fail.")
 
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    backend = args.backend
+    extended = backend == "gemma"
+    args.model_id = args.model_id or model_defaults[backend]
+    if args.batch_size is None:
+        args.batch_size = 1 if extended else 8
+    output_stem = "esr_gemma" if extended else "vlm_eval"
+    args.out_csv = args.out_csv or f"./{output_stem}_summary.csv"
+    args.intermediate_jsonl = args.intermediate_jsonl or f"./{output_stem}_intermediate.jsonl"
+    if args.batch_size < 1 or args.max_new_tokens < 1 or args.max_samples < 0:
+        parser.error("batch_size/max_new_tokens must be positive; max_samples must be >= 0")
+    if len(args.ref_seeds) != 3 or len(set(args.ref_seeds)) != 3:
+        parser.error("ref_seeds must contain exactly three unique seeds (reference images A/B/C)")
 
     # prompts load
     with open(args.prompts_json, "r", encoding="utf-8") as f:
@@ -462,16 +530,23 @@ def main():
     if not isinstance(data, dict) or len(data) == 0:
         raise ValueError(f"prompts_json is empty or invalid dict: {args.prompts_json}")
 
-    # model load
-    processor = AutoProcessor.from_pretrained(args.model_id)
-    model = Qwen3VLForConditionalGeneration.from_pretrained(
-        args.model_id,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-    )
-    model.eval()
-
     intermediate_path = Path(args.intermediate_jsonl)
+    if extended:
+        from esr_backends import validate_resume
+        eval_config = {
+            "backend": backend,
+            "model_id": args.model_id,
+            "index_mode": args.index_mode,
+            "ref_seeds": args.ref_seeds,
+            "base": args.base,
+            "base_root": str(Path(args.base_root or Path(args.results_root) / args.base).resolve()),
+            "base_category": args.base_category or args.category,
+            "results_root": str(Path(args.results_root).resolve()),
+            "prompts_sha256": hashlib.sha256(Path(args.prompts_json).read_bytes()).hexdigest(),
+            "max_new_tokens": args.max_new_tokens,
+            "protocol": "reference_abc_after_d_v1",
+        }
+        validate_resume(intermediate_path, eval_config)
     done_uids = load_done_uids(intermediate_path)
 
     # 전체 작업 목록 생성
@@ -484,7 +559,11 @@ def main():
                 print(f"[WARN] concept_key 형식 이상 (2개 또는 3개 concept 필요): {concept_key}")
             continue
 
-        for idx, item in enumerate(items):
+        for position, item in enumerate(items):
+            # Special style prompts are plain strings; prompt_02 uses objects.
+            if isinstance(item, str):
+                item = {"prompt": item}
+            idx = get_image_index(item, position, args.index_mode)
             prompt_text = item.get("prompt", "")
             for seed in args.eval_seeds:
                 uid = make_sample_uid(args.method, args.category, concept_key, idx, seed)
@@ -502,8 +581,14 @@ def main():
                     "prompt_text": prompt_text,
                 })
 
+    if args.max_samples:
+        jobs = jobs[:args.max_samples]
+        print(f"[LIMIT] Evaluating up to {args.max_samples} pending samples; this is not a full run")
     if args.verbose:
         print(f"[INFO] total pending jobs: {len(jobs)}")
+
+    # Load lazily after checking images; fully resumed/missing jobs need no GPU.
+    model = None
 
     processed = 0
     skipped = 0
@@ -515,15 +600,16 @@ def main():
         batch_jobs = jobs[start:start + args.batch_size]
 
         # concept 개수(2 또는 3)에 맞춰 동적 batch 구성
-        concept_batches = None
+        concept_batches = [[] for _ in range(max(len(job["concepts"]) for job in batch_jobs))]
+        concept_sample_indices = [[] for _ in concept_batches]
         valid_meta = []
 
         for job in batch_jobs:
             try:
                 before_paths = build_before_image_paths(
-                    results_root=args.results_root,
-                    base=args.base,
-                    category=args.category,
+                    results_root=args.base_root or args.results_root,
+                    base="" if args.base_root else args.base,
+                    category=args.base_category or args.category,
                     concept_key=job["concept_key_json"],
                     idx=job["idx"],
                     ref_seeds=args.ref_seeds,
@@ -553,9 +639,6 @@ def main():
                 after_img = safe_open_image(after_path)
                 image_list = ref_imgs + [after_img]
 
-                if concept_batches is None:
-                    concept_batches = [[] for _ in range(len(job["concepts"]))]
-
                 # JSON key에 적힌 concept 순서대로 평가
                 for concept_idx, target_concept in enumerate(job["concepts"]):
                     concept_batches[concept_idx].append({
@@ -563,6 +646,7 @@ def main():
                         "target": target_concept,
                         "images": image_list,
                     })
+                    concept_sample_indices[concept_idx].append(len(valid_meta))
 
                 valid_meta.append({
                     **job,
@@ -570,6 +654,11 @@ def main():
                     "after_path": after_path,
                 })
 
+            except FileNotFoundError as e:
+                skipped += 1
+                if args.verbose:
+                    print(f"[SKIP] {job['uid']}: {e}")
+                continue
             except Exception as e:
                 error_count += 1
                 if args.verbose:
@@ -579,23 +668,42 @@ def main():
         if len(valid_meta) == 0:
             continue
 
-        try:
-            verdicts_per_concept = []
+        if model is None:
+            if extended:
+                from esr_backends import load_backend, infer_batch
+                model, processor = load_backend(backend, args.model_id, cache_dir=args.cache_dir)
+                def evaluate_batch(**kwargs):
+                    return infer_batch(backend=backend, **kwargs)
+            else:
+                from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
+                processor = AutoProcessor.from_pretrained(args.model_id, cache_dir=args.cache_dir)
+                processor.tokenizer.padding_side = "left"
+                if processor.tokenizer.pad_token_id is None:
+                    processor.tokenizer.pad_token = processor.tokenizer.eos_token
+                model = Qwen3VLForConditionalGeneration.from_pretrained(
+                    args.model_id, torch_dtype=torch.bfloat16, device_map="auto", cache_dir=args.cache_dir,
+                ).eval()
+                evaluate_batch = eval_target_erasure_chat_batch
 
-            for batch_samples in concept_batches:
-                verdicts = eval_target_erasure_chat_batch(
+        try:
+            sample_outputs = [[] for _ in valid_meta]
+
+            for batch_samples, sample_indices in zip(concept_batches, concept_sample_indices):
+                if not batch_samples:
+                    continue
+                outputs = evaluate_batch(
                     model=model,
                     processor=processor,
                     batch_samples=batch_samples,
                     max_new_tokens=args.max_new_tokens,
                 )
-                verdicts_per_concept.append(verdicts)
+                if len(outputs) != len(batch_samples):
+                    raise RuntimeError("VLM returned an unexpected number of batch responses")
+                for sample_idx, output in zip(sample_indices, outputs):
+                    sample_outputs[sample_idx].append(output)
 
             for sample_idx, meta in enumerate(valid_meta):
-                sample_verdicts = [
-                    verdicts_per_concept[concept_idx][sample_idx]
-                    for concept_idx in range(len(meta["concepts"]))
-                ]
+                sample_verdicts = [normalize_one_word_response(x) for x in sample_outputs[sample_idx]]
 
                 row = {
                     "uid": meta["uid"],
@@ -615,14 +723,23 @@ def main():
                     row[f"concept_{concept_idx}"] = concept_name
                     row[f"verdict_{concept_idx}"] = sample_verdicts[concept_idx]
 
+                if extended:
+                    row.update({
+                        "model_id": args.model_id,
+                        "eval_config": eval_config,
+                        "erasure_fraction": sum(is_absent(v) for v in sample_verdicts) / len(sample_verdicts),
+                    })
+                    for concept_idx, response in enumerate(sample_outputs[sample_idx]):
+                        row[f"response_{concept_idx}"] = response
+
                 append_jsonl(intermediate_path, row)
                 processed += 1
 
         except Exception as e:
-            error_count += len(valid_meta)
-            if args.verbose:
-                print(f"[ERR-BATCH] {type(e).__name__}: {e}")
-            continue
+            raise RuntimeError(
+                f"{backend} inference failed; completed JSONL rows are preserved for resume. "
+                "For CUDA out-of-memory, retry with --batch_size 1."
+            ) from e
 
         pbar.set_postfix({
             "processed": processed,
@@ -637,29 +754,30 @@ def main():
         category=args.category,
         eval_seeds=args.eval_seeds,
     )
+    if extended:
+        from esr_backends import fractional_summary
+        summary.update(fractional_summary(intermediate_path, args.method, args.category, args.eval_seeds))
 
     out_csv_path = Path(args.out_csv)
-    out_csv_path.parent.mkdir(parents=True, exist_ok=True)
-
-    write_header = not out_csv_path.exists()
-    with open(out_csv_path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=["method", "category", "seed", "success_rate", "evaluated", "success"]
-        )
-        if write_header:
-            writer.writeheader()
-
-        writer.writerow({
-            "method": summary["method"],
-            "category": summary["category"],
-            "seed": ",".join(map(str, summary["eval_seeds"])),
-            "success_rate": f"{summary['success_rate']:.6f}",
-            "evaluated": summary["evaluated"],
-            "success": summary["success"],
+    summary_row = {
+        "method": summary["method"],
+        "category": summary["category"],
+        "seed": ",".join(map(str, summary["eval_seeds"])),
+        "success_rate": f"{summary['success_rate']:.6f}",
+        "evaluated": summary["evaluated"],
+        "success": summary["success"],
+    }
+    if extended:
+        summary_row.update({
+            "fractional_erasure_rate": f"{summary['fractional_erasure_rate']:.6f}",
+            "invalid_targets": summary["invalid_targets"],
+            "model_id": args.model_id,
         })
+    upsert_summary_csv(out_csv_path, summary_row)
 
     print("=== SUMMARY ===")
+    print(f"model_id={args.model_id}")
+    print(f"index_mode={args.index_mode}")
     print(f"method={summary['method']}")
     print(f"category={summary['category']}")
     print(f"eval_seeds={summary['eval_seeds']}")
@@ -671,6 +789,16 @@ def main():
     )
     print(f"intermediate_jsonl={str(intermediate_path.resolve())}")
     print(f"summary_csv={str(out_csv_path.resolve())}")
+    if extended:
+        print(f"fractional_erasure_rate={summary['fractional_erasure_rate']:.6f}, "
+              f"invalid_targets={summary['invalid_targets']}")
+    if summary["evaluated"] == 0:
+        raise RuntimeError("No images were evaluated; inspect image/reference paths and coverage")
+    if error_count or (skipped and not args.allow_partial):
+        raise RuntimeError(
+            f"ESR evaluation had errors={error_count}, skipped={skipped}; "
+            "fix the inputs and resume, or use --allow_partial for missing images."
+        )
 
 
 if __name__ == "__main__":

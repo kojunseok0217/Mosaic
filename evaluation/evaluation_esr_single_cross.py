@@ -11,7 +11,6 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from PIL import Image
 from tqdm import tqdm
-from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
 try:
     from huggingface_hub import login
@@ -178,6 +177,7 @@ def eval_target_presence_chat(
     target: str,
     prompt_text: str,
     max_new_tokens: int = 64,
+    backend: str = "qwen",
 ) -> str:
     prompt = f"""
 You are a strict visual evaluator for a concept-erasure benchmark.
@@ -222,17 +222,16 @@ present / absent / invalid
         ],
     }]
 
-    text = processor.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-
-    inputs = processor(
-        text=[text],
-        images=[image],
-        return_tensors="pt",
-    ).to(model.device)
+    if backend == "gemma":
+        from esr_backends import prepare_messages
+        inputs = prepare_messages(processor, [messages]).to(model.device)
+    else:
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+        inputs = processor(
+            text=[text], images=[image], return_tensors="pt",
+        ).to(model.device)
 
     outputs = model.generate(
         **inputs,
@@ -254,6 +253,7 @@ def eval_target_erasure_chat(
     target: str,
     prompt_text: str,
     max_new_tokens: int = 16,
+    backend: str = "qwen",
 ) -> str:
     if len(images) != 4:
         raise ValueError("reference evaluation requires [ref1, ref2, ref3, after_img]")
@@ -267,17 +267,16 @@ def eval_target_erasure_chat(
         ),
     }]
 
-    text = processor.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-
-    inputs = processor(
-        text=[text],
-        images=images,
-        return_tensors="pt",
-    ).to(model.device)
+    if backend == "gemma":
+        from esr_backends import prepare_messages
+        inputs = prepare_messages(processor, [messages]).to(model.device)
+    else:
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+        inputs = processor(
+            text=[text], images=images, return_tensors="pt",
+        ).to(model.device)
 
     outputs = model.generate(
         **inputs,
@@ -301,7 +300,7 @@ def append_csv_rows(csv_path: Path, fieldnames: List[str], rows: List[Dict[str, 
         writer.writerows(rows)
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Evaluate single-LoRA images saved as results/single/<category>/<key>/<concept>/<idx>/*.png."
     )
@@ -309,12 +308,12 @@ def parse_args():
     parser.add_argument("--results_root", type=str, default="./results/single")
     parser.add_argument("--category", type=str, default=None)
     parser.add_argument("--eval_mode", type=str, default="reference", choices=["reference", "single_image"],
-                        help="reference uses evaluation_vlm.py-style refs A/B/C + after D. single_image uses only after image.")
+                        help="reference uses evaluation_esr.py-style refs A/B/C + after D. single_image uses only after image.")
     parser.add_argument("--reference_results_root", type=str,
-                        default="/home/juniboy97/workspace/Diffusion-Unlearning/multi_concept_erasure/SplitFlow/results")
+                        default="./outputs")
     parser.add_argument("--reference_base", type=str, default="flux")
     parser.add_argument("--reference_layout", type=str, default="target", choices=["target", "concept_key"],
-                        help="target: <root>/<base>/seed_42/Mario/0/result_base.png. concept_key: evaluation_vlm.py path layout.")
+                        help="target: <root>/<base>/seed_42/Mario/0/result_base.png. concept_key: evaluation_esr.py path layout.")
     parser.add_argument("--ref_seeds", type=int, nargs="+", default=[42, 43, 44])
 
     parser.add_argument("--run_all_keys", action="store_true")
@@ -323,14 +322,27 @@ def parse_args():
     parser.add_argument("--sample_per_concept", type=int, default=10)
     parser.add_argument("--sampling_seed", type=int, default=42)
 
-    parser.add_argument("--model_id", type=str, default="Qwen/Qwen3-VL-8B-Instruct")
+    parser.add_argument("--backend", choices=["qwen", "gemma"], default="qwen")
+    parser.add_argument("--model_id", type=str, default=None)
+    parser.add_argument("--cache_dir", default=None)
     parser.add_argument("--hf_token", type=str, default=os.environ.get("HF_TOKEN"))
     parser.add_argument("--max_new_tokens", type=int, default=16)
 
-    parser.add_argument("--out_csv", type=str, default="./vlm_eval_single_cross_results.csv")
-    parser.add_argument("--out_detail_csv", type=str, default="./vlm_eval_single_cross_details.csv")
+    parser.add_argument("--out_csv", type=str, default=None)
+    parser.add_argument("--out_detail_csv", type=str, default=None)
     parser.add_argument("--verbose", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    args.model_id = args.model_id or (
+        "google/gemma-4-12B-it" if args.backend == "gemma" else "Qwen/Qwen3-VL-8B-Instruct"
+    )
+    stem = "esr_gemma_single_cross" if args.backend == "gemma" else "vlm_eval_single_cross"
+    args.out_csv = args.out_csv or f"./{stem}_results.csv"
+    args.out_detail_csv = args.out_detail_csv or f"./{stem}_details.csv"
+    if args.eval_mode == "reference" and (len(args.ref_seeds) != 3 or len(set(args.ref_seeds)) != 3):
+        parser.error("Reference evaluation requires exactly three unique --ref_seeds")
+    if args.sample_per_concept < 1 or args.max_new_tokens < 1:
+        parser.error("sample_per_concept and max_new_tokens must be positive")
+    return args
 
 
 def main():
@@ -358,12 +370,15 @@ def main():
 
     concept_filter = set(args.concepts) if args.concepts else None
 
-    processor = AutoProcessor.from_pretrained(args.model_id)
-    model = Qwen3VLForConditionalGeneration.from_pretrained(
-        args.model_id,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-    ).eval()
+    if args.backend == "gemma":
+        from esr_backends import load_backend
+        model, processor = load_backend("gemma", args.model_id, cache_dir=args.cache_dir)
+    else:
+        from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+        processor = AutoProcessor.from_pretrained(args.model_id, cache_dir=args.cache_dir)
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
+            args.model_id, torch_dtype=torch.bfloat16, device_map="auto", cache_dir=args.cache_dir,
+        ).eval()
 
     summary_rows: List[Dict[str, object]] = []
     detail_rows: List[Dict[str, object]] = []
@@ -434,6 +449,7 @@ def main():
                             target=concept,
                             prompt_text=prompt_text,
                             max_new_tokens=args.max_new_tokens,
+                            backend=args.backend,
                         )
                     else:
                         verdict = eval_target_presence_chat(
@@ -443,6 +459,7 @@ def main():
                             target=concept,
                             prompt_text=prompt_text,
                             max_new_tokens=args.max_new_tokens,
+                            backend=args.backend,
                         )
                 except Exception as exc:
                     skipped += 1

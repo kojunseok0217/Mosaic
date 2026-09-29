@@ -1,0 +1,8 @@
+# Compatible with the existing transformers 4.x evaluation environments.
+# Install a matching CUDA torch/torchvision pair first for GPU inference.
+pyiqa==0.1.15
+# The CLIP used by pyiqa 0.1.15 imports pkg_resources, removed in setuptools 81.
+setuptools>=70,<81
+Pillow>=9.0
+numpy>=1.23
+tqdm>=4.64

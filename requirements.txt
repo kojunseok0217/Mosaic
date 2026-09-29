@@ -10,6 +10,5 @@ scipy
 pandas
 datasets
 opencv-python
-pytorch-msssim
 sam3
 git+https://github.com/openai/CLIP.git
