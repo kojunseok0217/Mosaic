@@ -113,11 +113,6 @@ python mosaic_runner/run_mosaic_flux.py \
   --json_path prompt_generation/prompts/intra_2_character.json \
   --lora_root /path/to/lora/checkpoints \
   --save_dir outputs/mosaic/intra_2_character \
-  --run_all_keys \
-  --seed 42 \
-  --chunk_size 2 \
-  --skip_missing_lora \
-  --device cuda:0 \
   --T_steps 28 \
   --guidance_scale 3.5 \
   --mask_type continuous \
@@ -127,10 +122,7 @@ python mosaic_runner/run_mosaic_flux.py \
   --continuous_mask_threshold 0.5
 ```
 
-The mask is applied at zero-based steps 0 through 21 (inclusive). With
-`--mask_type continuous`, `--continuous_mask_threshold 0.5` binarizes the
-continuous mask using `m >= 0.5`. These settings are explicit in the example;
-omitting the threshold keeps the continuous mask. Use `--cache_dir /path/to/cache`
+Use `--cache_dir /path/to/cache`
 if the FLUX weights are stored in a custom Hugging Face cache.
 
 To generate images for selected concept keys:
@@ -142,8 +134,6 @@ python mosaic_runner/run_mosaic_flux.py \
   --lora_root /path/to/lora/checkpoints \
   --save_dir outputs/mosaic/selected \
   --keys "SpongeBob SquarePants + Mario" \
-  --skip_missing_lora \
-  --device cuda:0 \
   --mask_type continuous \
   --mask_apply_start_step 0 \
   --mask_apply_end_step 21 \
@@ -163,13 +153,6 @@ Evaluation scripts are in `evaluation/`:
 | `evaluation_selective_alignment.py` | Preservation of non-target elements |
 
 ### Erasure success rate (ESR)
-
-Qwen3 and Gemma use the same reference images A/B/C and generated image D,
-with the same `present` / `absent` / `invalid` verdicts. `success_rate` is the
-fraction of evaluated images where **all** target concepts are absent.
-Gemma also reports `fractional_erasure_rate`, the mean fraction of absent
-concepts per image, and `invalid_targets`. An invalid verdict is never counted
-as successful erasure. Rates are in [0, 1].
 
 The reference evaluator expects these paths under `--results_root`:
 
@@ -219,20 +202,6 @@ python evaluation/evaluation_esr_gemma.py \
   --intermediate_jsonl outputs/evaluation/gemma/intra_2_character.jsonl
 ```
 
-Gemma runs on a CUDA GPU with thinking disabled and greedy decoding.
-Use `--model_id` and `--cache_dir` to override the checkpoint and cache location.
-Keep different judges/settings in separate output files. Re-running with the
-same intermediate JSONL resumes completed images; CSV summaries are updated
-without duplicating the same method/category/seed row. Gemma checks the saved
-model and evaluation settings before resuming. Missing images cause a nonzero
-exit after saving completed results; `--allow_partial` permits missing images.
-`--max_samples 2` limits a smoke run to two pending images.
-
-Single-LoRA results use a different layout:
-`<results_root>/<category>/<concept key>/<single concept>/<index>/*.png`.
-Pass `--backend gemma` to `evaluation_esr_single_cross.py` to use Gemma in either
-`--eval_mode reference` or `--eval_mode single_image`. Use `--reference_results_root`
-and `--reference_layout` to select its reference paths. See `--help` for all options.
 
 ### Aesthetic score
 
@@ -266,18 +235,6 @@ python evaluation/evaluation_aesthetic.py \
   --device cuda:0 \
   --out_dir outputs/evaluation/aesthetic
 ```
-
-Use `--mosaic_dir` if the method directory is named differently, `--categories general`
-for all seven general categories, or `--seeds all` for all discovered seeds.
-The first inference downloads the CLIP and aesthetic predictor weights.
-Images are decoded as RGB with EXIF orientation applied, then passed at native
-resolution to the metric's default preprocessing. Only matching shapes are batched.
-
-Outputs include `per_image.csv`, `summary.csv`, `category_summary.csv`,
-`seed_summary.csv`, `coverage.csv`, and resume metadata. Means are weighted by
-image count; standard deviations use image-level sample statistics. Missing or
-corrupt images are never scored as zero. Use `--resume` with the same settings
-to reuse unchanged images and retry failed images; changed files are rescored.
 
 ## Model Weights and Outputs
 
